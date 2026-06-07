@@ -2,7 +2,7 @@ import os
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, Float, ForeignKey, JSON, Index, func, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -658,6 +658,65 @@ class Memory(Base):
         Index('ix_memories_lookup', 'category', 'timestamp'),  # Composite for category-based queries
         Index('ix_memories_session', 'session_id', 'timestamp'),  # Composite for session-based queries
     )
+
+
+class GraphNode(TimestampMixin, Base):
+    """A node in the owner-scoped memory graph: a canonical entity or concept.
+
+    Augments (does not replace) the flat Memory store + RAG. `type` is a closed
+    ontology (validated in code, see src/memory_graph.py). Embeddings for
+    semantic node search live in ChromaDB, not here.
+    """
+    __tablename__ = "graph_nodes"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)        # username; null = legacy/shared
+    type = Column(String, nullable=False, default="topic")   # closed entity-type enum
+    name = Column(String, nullable=False)                    # canonical display name
+    aliases = Column(JSON, default=list)                     # alternate surface forms
+    summary = Column(Text, default="")
+    confidence = Column(Float, default=1.0)
+    salience = Column(Float, default=0.0)                    # importance / decay signal
+    source_ref = Column(String, nullable=True)               # provenance (memory id / episode)
+
+    __table_args__ = (
+        Index('ix_graph_nodes_owner_name', 'owner', 'name'),
+        Index('ix_graph_nodes_owner_type', 'owner', 'type'),
+    )
+
+
+class GraphEdge(TimestampMixin, Base):
+    """A bi-temporal fact (relation) between two graph nodes.
+
+    Two timelines: event time (valid_at / invalid_at — when the fact is true in
+    reality) and transaction time (created_at from the mixin / expired_at — when
+    the system learned/retracted it). Facts are never deleted, only superseded
+    (invalid_at + expired_at set), so history and "what did I prefer then vs now"
+    are preserved. A current fact has invalid_at IS NULL AND expired_at IS NULL.
+    """
+    __tablename__ = "graph_edges"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    subject_id = Column(String, ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    predicate = Column(String, nullable=False)              # closed predicate enum
+    object_id = Column(String, ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    fact = Column(Text, default="")                         # natural-language statement
+    confidence = Column(Float, default=1.0)
+    salience = Column(Float, default=1.0)                   # evidence weight; reinforced on repeat, decays with time
+    last_seen = Column(DateTime, nullable=True)             # last reinforcement time; decay anchor (not auto-updated)
+
+    valid_at = Column(DateTime, nullable=True)              # event-time start
+    invalid_at = Column(DateTime, nullable=True)           # event-time end (NULL = currently true)
+    expired_at = Column(DateTime, nullable=True)           # transaction-time end (NULL = not retracted)
+    source_ref = Column(String, nullable=True)
+
+    __table_args__ = (
+        Index('ix_graph_edges_owner_subj', 'owner', 'subject_id'),
+        Index('ix_graph_edges_owner_pred', 'owner', 'predicate'),
+        Index('ix_graph_edges_spo', 'subject_id', 'predicate', 'object_id'),
+    )
+
 
 def _migrate_add_last_message_at_column():
     """Add last_message_at to sessions + backfill from the latest message
