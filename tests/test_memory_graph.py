@@ -21,7 +21,7 @@ from core.database import Base, GraphNode, GraphEdge
 from src.memory_graph import MemoryGraph, normalize_predicate, normalize_type
 
 if type(Base).__name__ == "MagicMock":
-    pytest.skip("core.database is stubbed — run this file in isolation", allow_module_level=True)
+    pytest.skip("core.database is stubbed; run this file in isolation", allow_module_level=True)
 
 
 def _graph():
@@ -31,7 +31,7 @@ def _graph():
     return MemoryGraph(session_factory=Session)
 
 
-# ── ontology normalization ──
+# ontology normalization
 
 def test_normalize_predicate_and_type():
     assert normalize_predicate("lives_in") == "LIVES_IN"
@@ -41,7 +41,7 @@ def test_normalize_predicate_and_type():
     assert normalize_type("nonsense") == "topic"
 
 
-# ── nodes / entity resolution ──
+# nodes / entity resolution
 
 def test_upsert_node_dedupes_by_name_and_collects_aliases():
     g = _graph()
@@ -76,7 +76,7 @@ def test_resolve_node_alias_match():
         db.close()
 
 
-# ── edges + temporal ──
+# edges + temporal
 
 def test_add_edge_rejects_unknown_predicate():
     g = _graph()
@@ -122,10 +122,10 @@ def test_non_functional_predicate_keeps_multiple():
     g.add_edge("alice", s, "HAS_PREFERENCE", tea)
     g.add_edge("alice", s, "HAS_PREFERENCE", coffee)
     current = g.current_edges("alice", subject_id=s, predicate="HAS_PREFERENCE")
-    assert len(current) == 2  # HAS_PREFERENCE is not functional — both stand
+    assert len(current) == 2  # HAS_PREFERENCE is not functional, both stand
 
 
-# ── traversal ──
+# traversal
 
 def test_neighbors_khop_traversal():
     g = _graph()
@@ -187,7 +187,7 @@ def test_graph_retrieve_owner_scoped():
     assert g.graph_retrieve("Bob Acme", "alice") == []
 
 
-# ── get_name (identity) ──
+# get_name (identity)
 
 def test_get_name_distinct_nodes_returns_both():
     g = _graph()
@@ -237,3 +237,81 @@ def test_neighbors_as_of_time_travel():
     past_ids = {n.id for n in past_res["nodes"]}
     assert rome in past_ids
     assert milan not in past_ids
+
+
+# regression: review fixes (temporal correctness + entity resolution)
+
+def test_add_edge_rejects_missing_endpoint():
+    # A failed upsert_node returns None; add_edge must reject a None endpoint with
+    # the same sentinel instead of inserting a dangling edge.
+    g = _graph()
+    o = g.upsert_node("alice", "Rome", "place")
+    assert g.add_edge("alice", None, "LIVES_IN", o) is None
+    assert g.add_edge("alice", o, "LIVES_IN", None) is None
+
+
+def test_consolidate_is_transaction_time_only_keeps_as_of_history():
+    # Decay-based consolidation must NOT stamp event-time invalid_at: the evidence
+    # faded, the fact never became false. So an as-of query AFTER the consolidation
+    # run still sees it (event-time intact), while current truth drops it.
+    g = _graph()
+    me = g.upsert_node("alice", "Alice", "person")
+    fad = g.upsert_node("alice", "kombucha", "preference")
+    t0 = datetime(2025, 1, 1)
+    now = datetime(2026, 6, 1)                      # ~17 months -> decayed below floor
+    g.add_edge("alice", me, "HAS_PREFERENCE", fad, fact="liked kombucha", valid_at=t0, now=t0)
+
+    assert g.consolidate_persona("alice", now=now) == 1
+    assert g.current_edges("alice", subject_id=me, predicate="HAS_PREFERENCE") == []
+
+    db = g._session()
+    try:
+        e = db.query(GraphEdge).filter(
+            GraphEdge.owner == "alice", GraphEdge.predicate == "HAS_PREFERENCE").first()
+        assert e.invalid_at is None          # event-time untouched
+        assert e.expired_at is not None      # transaction-time retraction only
+    finally:
+        db.close()
+
+    # As-of AFTER the consolidation run still surfaces it (the bug stamped
+    # invalid_at=now, which would hide it from this query).
+    after = g.neighbors("alice", [me], hops=1, as_of=datetime(2026, 8, 1))
+    assert fad in {n.id for n in after["nodes"]}
+
+
+def test_backdated_supersession_does_not_invert_the_interval():
+    # A backdated correction (new valid_at earlier than the existing edge's) must
+    # not close the old edge's event-time interval before it opened.
+    g = _graph()
+    s = g.upsert_node("alice", "Alice", "person")
+    rome = g.upsert_node("alice", "Rome", "place")
+    milan = g.upsert_node("alice", "Milan", "place")
+    e1 = g.add_edge("alice", s, "LIVES_IN", rome, valid_at=datetime(2026, 6, 1), now=datetime(2026, 6, 1))
+    g.add_edge("alice", s, "LIVES_IN", milan, valid_at=datetime(2020, 1, 1), now=datetime(2026, 6, 2))
+
+    db = g._session()
+    try:
+        old = db.query(GraphEdge).filter(GraphEdge.id == e1).first()
+        assert old.invalid_at is not None
+        assert old.invalid_at >= old.valid_at      # no inverted/empty-before-open interval
+    finally:
+        db.close()
+
+
+def test_upsert_merges_aliases_on_resolve_and_dedups_by_norm():
+    g = _graph()
+    nid = g.upsert_node("alice", "Robert", "person")
+    # Re-upsert resolves to the same node and MERGES caller aliases (not dropped).
+    assert g.upsert_node("alice", "robert", "person", aliases=["Bob", "Bobby"]) == nid
+    # A case variant resolves via the "Bob" alias and must not add a duplicate.
+    g.upsert_node("alice", "BOB", "person")
+
+    db = g._session()
+    try:
+        node = db.query(GraphNode).filter(GraphNode.id == nid).first()
+        norms = [a.strip().lower() for a in (node.aliases or [])]
+        assert node.name == "Robert"                       # canonical name kept
+        assert "bob" in norms and "bobby" in norms         # caller aliases merged on resolve
+        assert norms.count("bob") == 1                     # case variant did not duplicate
+    finally:
+        db.close()

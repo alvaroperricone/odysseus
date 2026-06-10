@@ -1,4 +1,4 @@
-"""memory_graph.py — the persistent, owner-scoped memory graph store.
+"""memory_graph.py: the persistent, owner-scoped memory graph store.
 
 Backed by SQLite (GraphNode / GraphEdge tables) + optionally ChromaDB for
 semantic node/edge search. This is the storage + traversal + temporal layer;
@@ -11,7 +11,7 @@ Reliability principles (4-6B models):
 - Bi-temporal supersession is RULE-based for functional predicates: a new fact
   with the same (subject, predicate) but a different object deterministically
   invalidates the prior one. Nothing is deleted (non-lossy / auditable).
-- k-hop traversal is a bounded BFS in code — no graph DB, no LLM at query time.
+- k-hop traversal is a bounded BFS in code, with no graph DB and no LLM at query time.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── closed ontology ──
+# closed ontology
 
 ENTITY_TYPES = frozenset({
     "person", "preference", "place", "organization", "event", "project",
@@ -39,7 +39,7 @@ PREDICATES = frozenset({
 })
 
 # Single-valued ("functional") predicates: a subject has at most one current
-# object. A new value supersedes the old deterministically — no LLM judgment.
+# object. A new value supersedes the old deterministically, with no LLM judgment.
 FUNCTIONAL_PREDICATES = frozenset({
     "LIVES_IN", "WORKS_FOR", "OCCURRED_ON", "HAS_NAME", "PREFERS_NAME",
 })
@@ -94,12 +94,12 @@ class MemoryGraph:
         from core.database import SessionLocal
         return SessionLocal()
 
-    # ── nodes ──
+    # nodes
 
     def resolve_node(self, db, owner, name: str, type: Optional[str] = None) -> Optional[str]:
         """Find an existing node id for `name` (code-first entity resolution):
         exact canonical match, then alias match, then optional fuzzy match.
-        Returns None if no confident match — caller creates a new node."""
+        Returns None if no confident match, so the caller creates a new node."""
         from core.database import GraphNode
 
         norm = _norm_name(name)
@@ -119,17 +119,20 @@ class MemoryGraph:
             for a in (n.aliases or []):
                 if _norm_name(a) == norm:
                     return n.id
-        # 3. optional fuzzy match (rapidfuzz), conservative threshold
+        # 3. optional fuzzy match (rapidfuzz), conservative threshold. Score
+        #    against the canonical name AND every alias, and break exact ties by
+        #    id so resolution is deterministic regardless of row order / backend.
         try:
             from rapidfuzz import fuzz
             best_id, best_score = None, 0.0
             for n in candidates:
-                score = fuzz.WRatio(norm, _norm_name(n.name))
-                if score > best_score:
+                surfaces = [n.name, *(n.aliases or [])]
+                score = max(fuzz.WRatio(norm, _norm_name(s)) for s in surfaces)
+                if score > best_score or (score == best_score and best_id is not None and n.id < best_id):
                     best_id, best_score = n.id, score
             if best_id is not None and best_score >= 92.0:
                 return best_id
-        except Exception:  # noqa: BLE001 — rapidfuzz optional; absence is fine
+        except Exception:  # noqa: BLE001 (rapidfuzz optional; absence is fine)
             pass
         return None
 
@@ -153,12 +156,22 @@ class MemoryGraph:
             if existing_id:
                 node = db.query(GraphNode).filter(GraphNode.id == existing_id).first()
                 if node is not None:
-                    # Record a new surface form as an alias (keep canonical name).
-                    if _norm_name(node.name) != _norm_name(name):
-                        al = list(node.aliases or [])
-                        if name not in al and node.name != name:
-                            al.append(name)
-                            node.aliases = al
+                    # Record the new surface form AND any caller-supplied aliases,
+                    # deduped by NORMALIZED form (resolution is norm-insensitive, so
+                    # the guard must be too) and never the canonical name. Non-lossy:
+                    # only appends.
+                    al = list(node.aliases or [])
+                    have = {_norm_name(x) for x in al} | {_norm_name(node.name)}
+                    changed = False
+                    for form in [name, *(aliases or [])]:
+                        form = (form or "").strip()
+                        fn = _norm_name(form)
+                        if form and fn not in have:
+                            al.append(form)
+                            have.add(fn)
+                            changed = True
+                    if changed:
+                        node.aliases = al
                     if summary and not node.summary:
                         node.summary = summary
                     db.commit()
@@ -174,6 +187,9 @@ class MemoryGraph:
             db.commit()
             self._index_node(node_id, name, summary)
             return node_id
+        except Exception:
+            db.rollback()   # don't leave a (possibly caller-owned) session dirty
+            raise
         finally:
             if own_db:
                 db.close()
@@ -186,7 +202,7 @@ class MemoryGraph:
         except Exception:  # noqa: BLE001
             logger.debug("node vector index failed for %s", node_id)
 
-    # ── edges (bi-temporal) ──
+    # edges (bi-temporal)
 
     def add_edge(
         self, owner, subject_id: str, predicate: str, object_id: str, *,
@@ -201,6 +217,13 @@ class MemoryGraph:
         if pred is None:
             logger.debug("rejected edge with unknown predicate %r", predicate)
             return None
+        # Endpoints must exist: upsert_node returns None on an empty surface form,
+        # and the documented pattern is add_edge(owner, upsert_node(...), pred,
+        # upsert_node(...)). Reject a missing endpoint with the same None sentinel
+        # instead of inserting a dangling edge / raising IntegrityError.
+        if subject_id is None or object_id is None:
+            logger.debug("rejected edge with missing endpoint (subj=%r obj=%r)", subject_id, object_id)
+            return None
         own_db = db is None
         db = db or self._session()
         try:
@@ -209,7 +232,7 @@ class MemoryGraph:
             now = now or datetime.utcnow()
             valid_at = valid_at or now
 
-            # Reinforce an identical CURRENT fact instead of duplicating it —
+            # Reinforce an identical CURRENT fact instead of duplicating it:
             # repeated observation strengthens the persona signal (salience).
             existing = db.query(GraphEdge).filter(
                 GraphEdge.owner == owner,
@@ -238,7 +261,12 @@ class MemoryGraph:
                     GraphEdge.expired_at.is_(None),
                 ).all()
                 for c in conflicts:
-                    c.invalid_at = valid_at      # event-time: stopped being true now
+                    # Event-time: the old fact stops being true when the new one
+                    # starts, but never before it began, so a backdated correction
+                    # can't create an inverted interval that erases the old fact from
+                    # as-of history (non-lossy invariant). Forward case is unchanged
+                    # (max(t0, t1) == t1).
+                    c.invalid_at = max(c.valid_at or valid_at, valid_at)
                     c.expired_at = now           # transaction-time: we retracted it now
 
             edge_id = uuid.uuid4().hex[:16]
@@ -253,6 +281,9 @@ class MemoryGraph:
             db.commit()
             self._index_edge(edge_id, fact)
             return edge_id
+        except Exception:
+            db.rollback()   # discard the insert + in-Python supersession together
+            raise
         finally:
             if own_db:
                 db.close()
@@ -265,7 +296,7 @@ class MemoryGraph:
         except Exception:  # noqa: BLE001
             logger.debug("edge vector index failed for %s", edge_id)
 
-    # ── traversal ──
+    # traversal
 
     @staticmethod
     def _edge_current(edge, as_of: Optional[datetime]) -> bool:
@@ -392,7 +423,7 @@ class MemoryGraph:
             if own_db:
                 db.close()
 
-    # ── persona layer (user model: confidence/decay) ──
+    # persona layer (user model: confidence/decay)
 
     @staticmethod
     def _effective_salience(edge, now: datetime, half_life: float = PERSONA_HALF_LIFE_DAYS) -> float:
@@ -453,12 +484,16 @@ class MemoryGraph:
             # "chiamami Alvaro") to ONE node, so HAS_NAME and PREFERS_NAME may
             # share an object_id. Keying by object_id would let one clobber the
             # other; key by predicate and keep the highest-salience current edge.
+            now = datetime.utcnow()
             best = {}  # predicate -> chosen edge
             for e in self.current_edges(owner, db=db):
                 if e.predicate not in ("HAS_NAME", "PREFERS_NAME"):
                     continue
                 cur = best.get(e.predicate)
-                if cur is None or (e.salience or 0.0) > (cur.salience or 0.0):
+                # Rank by time-decayed salience, consistent with get_persona /
+                # persona_summary_text (functional supersession usually leaves one
+                # current edge, so this is a defensive, deterministic tiebreak).
+                if cur is None or self._effective_salience(e, now) > self._effective_salience(cur, now):
                     best[e.predicate] = e
             if not best:
                 return {}
@@ -482,7 +517,7 @@ class MemoryGraph:
                              max_items: int = 12, exclude_sections=(), db=None) -> str:
         """Compact, salience-ranked persona block to ground the assistant's
         replies in the user's stable preferences/traits. `exclude_sections` drops
-        whole sections (e.g. "identity") — the bot's reply path surfaces the
+        whole sections (e.g. "identity"); the bot's reply path surfaces the
         user's name via a structured prompt block, NOT these 2nd-person facts,
         which a small model otherwise mistakes for its own identity."""
         persona = self.get_persona(owner, now=now, db=db)
@@ -512,7 +547,7 @@ class MemoryGraph:
                             floor: float = PERSONA_RETIRE_FLOOR, db=None) -> int:
         """Retire (non-lossy) stale, low-evidence preference/trait edges whose
         decayed salience has fallen below the floor. Functional state edges
-        (location/employer) are never auto-retired — they persist until
+        (location/employer) are never auto-retired; they persist until
         superseded. Returns the number retired."""
         own_db = db is None
         db = db or self._session()
@@ -529,12 +564,17 @@ class MemoryGraph:
                 if e.predicate in FUNCTIONAL_PREDICATES:
                     continue
                 if self._effective_salience(e, now, half_life) < floor:
-                    e.invalid_at = now
+                    # Transaction-time retraction ONLY: the evidence faded, the fact
+                    # did not become false in reality, so invalid_at stays None and as-of
+                    # event-time history (before and after this run) is unchanged.
                     e.expired_at = now
                     retired += 1
             if retired:
                 db.commit()
             return retired
+        except Exception:
+            db.rollback()
+            raise
         finally:
             if own_db:
                 db.close()

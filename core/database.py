@@ -688,8 +688,8 @@ class GraphNode(TimestampMixin, Base):
 class GraphEdge(TimestampMixin, Base):
     """A bi-temporal fact (relation) between two graph nodes.
 
-    Two timelines: event time (valid_at / invalid_at — when the fact is true in
-    reality) and transaction time (created_at from the mixin / expired_at — when
+    Two timelines: event time (valid_at / invalid_at, when the fact is true in
+    reality) and transaction time (created_at from the mixin / expired_at, when
     the system learned/retracted it). Facts are never deleted, only superseded
     (invalid_at + expired_at set), so history and "what did I prefer then vs now"
     are preserved. A current fact has invalid_at IS NULL AND expired_at IS NULL.

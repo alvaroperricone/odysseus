@@ -1,8 +1,8 @@
-"""text_tokens.py — tiny, dependency-free content tokenizer.
+"""text_tokens.py: tiny, dependency-free content tokenizer.
 
 Shared stopword tokenizer used by retrieval/ranking code. Kept in its own module
-(imports only `re`) so lightweight consumers — e.g. the knowledge-only reasoner
-loop — can use it without dragging in the web-search / chat stack.
+(imports only `re`) so lightweight consumers like the knowledge-only reasoner
+loop can use it without dragging in the web-search / chat stack.
 
 Mirrors the tokenizer historically defined in src/chat_processor.py.
 """
